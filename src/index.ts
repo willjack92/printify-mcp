@@ -506,13 +506,129 @@ When done, return to the user:
   }
 }
 
+// --- OAuth stub helpers (anonymous access; satisfies claude.ai custom-connector OAuth flow) ---
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, MCP-Protocol-Version, Mcp-Session-Id",
+  "Access-Control-Max-Age": "86400",
+};
+
+function jsonResp(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+function workerOrigin(request: Request): string {
+  const u = new URL(request.url);
+  return `${u.protocol}//${u.host}`;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    // --- OAuth 2.1 stub endpoints (claude.ai custom connector compatibility) ---
+    // Anyone with the worker URL can mint a token. No real user auth.
+    // The worker's Printify API key (Cloudflare secret) is the actual access control.
+    const origin = workerOrigin(request);
+
+    if (url.pathname === "/.well-known/oauth-protected-resource"
+        || url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+      return jsonResp({
+        resource: `${origin}/mcp`,
+        authorization_servers: [origin],
+        bearer_methods_supported: ["header"],
+        scopes_supported: ["mcp"],
+      });
+    }
+
+    if (url.pathname === "/.well-known/oauth-authorization-server"
+        || url.pathname === "/.well-known/openid-configuration") {
+      return jsonResp({
+        issuer: origin,
+        authorization_endpoint: `${origin}/oauth/authorize`,
+        token_endpoint: `${origin}/oauth/token`,
+        registration_endpoint: `${origin}/oauth/register`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code", "refresh_token"],
+        code_challenge_methods_supported: ["S256", "plain"],
+        token_endpoint_auth_methods_supported: ["none", "client_secret_basic", "client_secret_post"],
+        scopes_supported: ["mcp"],
+      });
+    }
+
+    if (url.pathname === "/oauth/register" && request.method === "POST") {
+      const body = await request.json().catch(() => ({} as any));
+      const clientId = `printify-${crypto.randomUUID().slice(0, 12)}`;
+      return jsonResp({
+        client_id: clientId,
+        redirect_uris: (body as any).redirect_uris || [],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        client_name: (body as any).client_name || "MCP Client",
+        scope: "mcp",
+      }, 201);
+    }
+
+    if (url.pathname === "/oauth/authorize") {
+      const redirectUri = url.searchParams.get("redirect_uri");
+      const state = url.searchParams.get("state") || "";
+      if (!redirectUri) {
+        return new Response("missing redirect_uri", { status: 400, headers: CORS_HEADERS });
+      }
+      const code = crypto.randomUUID();
+      const redirect = new URL(redirectUri);
+      redirect.searchParams.set("code", code);
+      if (state) redirect.searchParams.set("state", state);
+      return Response.redirect(redirect.toString(), 302);
+    }
+
+    if (url.pathname === "/oauth/token" && request.method === "POST") {
+      const token = `sk-anon-${crypto.randomUUID()}`;
+      return jsonResp({
+        access_token: token,
+        token_type: "Bearer",
+        expires_in: 31536000,
+        refresh_token: `rt-${crypto.randomUUID()}`,
+        scope: "mcp",
+      });
+    }
+
+    // --- MCP transport endpoints (gated by Bearer-token presence) ---
+    const checkBearer = () => {
+      const auth = request.headers.get("authorization") || "";
+      return auth.toLowerCase().startsWith("bearer ");
+    };
+    const challenge401 = () => new Response(
+      JSON.stringify({ error: "unauthorized" }),
+      {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+          "WWW-Authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"`,
+          ...CORS_HEADERS,
+        },
+      },
+    );
+
     if (url.pathname === "/sse" || url.pathname === "/sse/message") {
+      if (!checkBearer()) return challenge401();
       return PrintifyMCP.serveSSE("/sse").fetch(request, env, ctx);
     }
     if (url.pathname === "/mcp") {
+      if (!checkBearer()) return challenge401();
       return PrintifyMCP.serve("/mcp").fetch(request, env, ctx);
     }
     // Direct REST endpoints so a Bash/Python script can hit Printify
